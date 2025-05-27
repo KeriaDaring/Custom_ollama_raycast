@@ -13,6 +13,7 @@ import datetime # Add this import
 import asyncio # Add this import
 import json # Ensure json is imported
 
+
 # 加载.env文件中的变量到系统环境变量中
 load_dotenv()
 app = FastAPI()
@@ -60,30 +61,133 @@ async def show_model(request: Request):
     else:
         raise HTTPException(status_code=404, detail="Model not found")
 
+def process_mcp_tool_calls(tool_calls):
+    """Process tool calls to ensure MCP compliance with required 'thought' field"""
+    if not tool_calls:
+        return tool_calls
+    
+    processed_tool_calls = []
+    for tool_call in tool_calls:
+        if isinstance(tool_call, dict):
+            # Ensure MCP required fields are present
+            processed_call = tool_call.copy()
+            
+            # Ensure other MCP required fields
+            if "id" not in processed_call:
+                processed_call["id"] = f"call_{len(processed_tool_calls)}"
+            
+            if "type" not in processed_call:
+                processed_call["type"] = "function"
+            
+            # Process function details
+            if "function" in processed_call:
+                func_details = processed_call["function"]
+                if isinstance(func_details, dict):
+                    # Handle arguments - ensure it's properly formatted
+                    if "arguments" in func_details:
+                        args = func_details["arguments"]
+                        
+                        # Convert dict to JSON string for OpenAI API if needed
+                        if isinstance(args, dict):
+                            # For MCP tools that require 'thought' parameter, add it if missing and arguments are empty
+                            if not args and func_details.get("name", "").endswith("sequentialthinking"):
+                                args["thought"] = "Starting analysis"
+                                args["nextThoughtNeeded"] = True
+                                args["thoughtNumber"] = 1
+                                args["totalThoughts"] = 3
+                            
+                            func_details["arguments"] = json.dumps(args)
+                        elif not isinstance(args, str):
+                            func_details["arguments"] = str(args)
+            
+            processed_tool_calls.append(processed_call)
+    
+    return processed_tool_calls
+
+def enhance_tool_calls_for_streaming(tool_calls):
+    """Enhanced processing for streaming tool calls with better MCP compliance"""
+    if not tool_calls:
+        return tool_calls
+    
+    enhanced_calls = []
+    for i, tool_call in enumerate(tool_calls):
+        if isinstance(tool_call, dict):
+            enhanced_call = tool_call.copy()
+            
+            # Ensure required fields
+            if "id" not in enhanced_call:
+                enhanced_call["id"] = f"call_{i}"
+            
+            if "type" not in enhanced_call:
+                enhanced_call["type"] = "function"
+            
+            # Process function details
+            if "function" in enhanced_call:
+                func_details = enhanced_call["function"]
+                if isinstance(func_details, dict):
+                    # Handle arguments conversion and validation
+                    if "arguments" in func_details:
+                        args = func_details["arguments"]
+                        
+                        # Parse JSON string back to dict for Ollama format
+                        if isinstance(args, str):
+                            try:
+                                parsed_args = json.loads(args) if args else {}
+                            except json.JSONDecodeError:
+                                parsed_args = {}
+                        else:
+                            parsed_args = args if isinstance(args, dict) else {}
+                        
+                        # For sequential thinking tool, ensure required parameters
+                        if func_details.get("name", "").endswith("sequentialthinking"):
+                            if not parsed_args or not parsed_args.get("thought"):
+                                parsed_args.update({
+                                    "thought": "Starting analysis",
+                                    "nextThoughtNeeded": True,
+                                    "thoughtNumber": 1,
+                                    "totalThoughts": 3
+                                })
+                        
+                        # For search tools, ensure query parameter
+                        elif "search" in func_details.get("name", "").lower():
+                            if not parsed_args.get("query"):
+                                # Try to extract from recent user message or use default
+                                parsed_args["query"] = "search query"
+                        
+                        func_details["arguments"] = parsed_args
+            
+            enhanced_calls.append(enhanced_call)
+    
+    return enhanced_calls
+
 @app.post("/api/chat")
 async def chat_model(request: Request):
     data = await request.json()
     print("Received data for /api/chat:", data) 
     
     request_model_name = data.get("model", "") 
-    messages = data.get("messages", [])
+    messages: List[Dict[str, Any]] = data.get("messages", []) # Ensure type hint
     stream = data.get("stream", False)
     ollama_tools = data.get("tools", []) # Renamed from 'tools' to avoid confusion
     ollama_options = data.get("options", {}) # Get options dictionary
 
-    # Preprocess messages to ensure tool_calls.function.arguments is a string
-    for message in messages:
-        if "tool_calls" in message and isinstance(message["tool_calls"], list):
-            for tool_call in message["tool_calls"]:
-                if isinstance(tool_call, dict) and "function" in tool_call and isinstance(tool_call["function"], dict):
-                    if "arguments" in tool_call["function"] and isinstance(tool_call["function"]["arguments"], dict):
-                        tool_call["function"]["arguments"] = json.dumps(tool_call["function"]["arguments"])
-                    # Also ensure arguments is present, even if empty, as a string
-                    elif "arguments" not in tool_call["function"]:
-                         tool_call["function"]["arguments"] = "{}" # Or handle as per API expectation for empty args
+    # Enhanced message preprocessing with better tool call handling
+    for msg_idx, msg_content in enumerate(messages):
+        if msg_content.get("role") == "assistant" and "tool_calls" in msg_content:
+            if isinstance(msg_content.get("tool_calls"), list):
+                # Process tool calls for MCP compliance
+                msg_content["tool_calls"] = process_mcp_tool_calls(msg_content["tool_calls"])
 
-    # Parameters to pass directly to the OpenAI client, mapped from Ollama's options
-    # These will be passed as keyword arguments to the ModelScopeClient
+        # Handle tool response messages
+        elif msg_content.get("role") == "tool":
+            # Tool response messages should be fine as is, but ensure content is a string
+            if "content" in msg_content and not isinstance(msg_content["content"], str):
+                msg_content["content"] = json.dumps(msg_content["content"]) if isinstance(msg_content["content"], dict) else str(msg_content["content"])
+            
+            # Ensure MCP required fields for tool messages
+            if "tool_call_id" not in msg_content and "call_id" in msg_content:
+                msg_content["tool_call_id"] = msg_content["call_id"]
+
     client_kwargs = {}
     if ollama_options:
         if "temperature" in ollama_options and ollama_options["temperature"] is not None:
@@ -96,8 +200,6 @@ async def chat_model(request: Request):
             client_kwargs["max_tokens"] = ollama_options["num_predict"] # OpenAI's max_tokens
         if "stop" in ollama_options and ollama_options["stop"] is not None: # Ollama's stop
             client_kwargs["stop"] = ollama_options["stop"] # OpenAI's stop (can be str or list of str)
-        # Add other known OpenAI parameters if they exist in ollama_options and are supported by the client
-        # e.g., presence_penalty, frequency_penalty
 
     # Convert Ollama tools to OpenAI format if present
     openai_tools_list = []
@@ -113,11 +215,9 @@ async def chat_model(request: Request):
                     "type": "function",
                     "function": tool_config["function"]
                 })
-            # else: Consider logging a warning for unhandled tool types
 
     if openai_tools_list:
         client_kwargs["tools"] = openai_tools_list
-        # client_kwargs["tool_choice"] = "auto" # Let OpenAI client default this, usually "auto" if tools are present
 
     if request_model_name == "deepseek" or request_model_name.startswith("qwen"):
         api_key = os.getenv("MODELSCOPE_API_KEY")
@@ -131,27 +231,19 @@ async def chat_model(request: Request):
         client = ModelScopeClient(api_key=api_key)
         
         # Define the upstream ModelScope model ID.
-        # This could be mapped from request_model_name if you support multiple ModelScope models.
         upstream_model_id = 'Qwen/Qwen3-235B-A22B' # Default ModelScope model for "deepseek"
         if request_model_name.startswith("qwen"): # Example: if Raycast asks for "qwen-7b", map it
-            # Potentially map request_model_name to a specific ModelScope model ID here
-            # For now, we'll use the default Qwen model above for any qwen-prefixed request.
             pass
 
         extra_body_params = {
             "enable_thinking": False,
-            # "thinking_budget": 4096 # Optional
         }
-        
-
-        # Tools are now part of client_kwargs if present
-        # The old tool_params is not needed.
 
         if not stream:
             try:
                 api_response_data = client.chat_completions(
                     model=upstream_model_id,
-                    messages=messages, # Use processed_messages
+                    messages=messages,
                     stream=False,
                     extra_body=extra_body_params,
                     **client_kwargs 
@@ -168,6 +260,8 @@ async def chat_model(request: Request):
                             content = message["content"]
                         if message.get("tool_calls"):
                             tool_calls = message["tool_calls"]
+                            # Enhanced tool call processing for better MCP compliance
+                            tool_calls = enhance_tool_calls_for_streaming(tool_calls)
                 
                 usage = api_response_data.get("usage", {})
                 prompt_tokens = usage.get("prompt_tokens")
@@ -204,17 +298,15 @@ async def chat_model(request: Request):
             def ollama_modelscope_stream_generator():
                 response_model_name_for_ollama = data.get("model", "deepseek") 
                 stream_created_at = datetime.datetime.now(datetime.UTC).isoformat() + "Z"
-                
-                # full_content_for_final_message = [] # To accumulate content if needed for final stats (not used here)
 
                 try:
                     # The client.chat_completions itself returns a generator for streaming
                     for chunk in client.chat_completions(
                                             model=upstream_model_id,
-                                            messages=messages, # Pass the preprocessed messages
+                                            messages=messages,
                                             stream=True, 
                                             extra_body=extra_body_params,
-                                            **client_kwargs): # Pass mapped options and tools here
+                                            **client_kwargs):
                         
                         # chunk is an OpenAI ChatCompletionChunk object
                         if chunk.choices and chunk.choices[0].delta:
@@ -231,7 +323,6 @@ async def chat_model(request: Request):
                                     "done": False
                                 }
                                 yield f"{json.dumps(ollama_chunk_reasoning)}\n"
-                                # full_content_for_final_message.append(reasoning_text)
 
                             # Process standard content
                             if delta.content:
@@ -242,39 +333,61 @@ async def chat_model(request: Request):
                                     "done": False
                                 }
                                 yield f"{json.dumps(ollama_chunk_content)}\n"
-                                # full_content_for_final_message.append(delta.content)
                             
-                            # Handle tool calls in streaming
+                            # Handle tool calls in streaming with enhanced MCP compliance
                             if hasattr(delta, 'tool_calls') and delta.tool_calls:
-                                for tool_call_chunk in delta.tool_calls: # Iterate through tool_call_chunks
-                                    # Reconstruct the tool_call object for Ollama format
-                                    # ModelScope might stream tool calls piece by piece.
-                                    # We need to aggregate them or handle them according to how Ollama expects them.
-                                    # For simplicity, let's assume a full tool_call structure is in the chunk if present.
-                                    # This part might need refinement based on actual ModelScope streaming behavior for tools.
+                                enhanced_tool_calls = []
+                                
+                                for i, tool_call_chunk in enumerate(delta.tool_calls):
+                                    # Process arguments
+                                    arguments = tool_call_chunk.function.arguments or ""
+                                    try:
+                                        parsed_args = json.loads(arguments) if arguments else {}
+                                    except json.JSONDecodeError:
+                                        parsed_args = {}
                                     
-                                    # Ensure arguments are stringified if they are dicts,
-                                    # though for responses, they usually are strings already.
-                                    # However, the error was for *input* messages.
-                                    # For output streaming, we need to format it for Ollama.
+                                    # Enhanced argument handling for specific tools
+                                    func_name = tool_call_chunk.function.name
+                                    if func_name and func_name.endswith("sequentialthinking"):
+                                        if not parsed_args or not parsed_args.get("thought"):
+                                            parsed_args.update({
+                                                "thought": "Starting analysis",
+                                                "nextThoughtNeeded": True,
+                                                "thoughtNumber": 1,
+                                                "totalThoughts": 3
+                                            })
+                                    elif "search" in func_name.lower() and not parsed_args.get("query"):
+                                        # Extract search query from conversation context
+                                        user_messages = [msg for msg in messages if msg.get("role") == "user"]
+                                        if user_messages:
+                                            last_user_msg = user_messages[-1].get("content", "")
+                                            # Simple extraction - look for text after @ mentions
+                                            if "@" in last_user_msg:
+                                                query_part = last_user_msg.split("@")[-1].strip()
+                                                if query_part:
+                                                    parsed_args["query"] = query_part
                                     
+                                    # Create enhanced tool call
+                                    enhanced_tool_call = {
+                                        "index": tool_call_chunk.index if hasattr(tool_call_chunk, 'index') else i,
+                                        "id": tool_call_chunk.id or f"call_{i}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": func_name,
+                                            "arguments": parsed_args
+                                        }
+                                    }
+                                    
+                                    enhanced_tool_calls.append(enhanced_tool_call)
+                                
+                                if enhanced_tool_calls:
                                     ollama_tool_call_chunk = {
                                         "model": response_model_name_for_ollama,
                                         "created_at": stream_created_at,
                                         "message": {
                                             "role": "assistant",
-                                            "content": None, # Typically null when tool_calls are present
-                                            "tool_calls": [ # Ollama expects a list of tool calls
-                                                {
-                                                    "index": tool_call_chunk.index, # Preserve index
-                                                    "id": tool_call_chunk.id,
-                                                    "type": "function", # Assuming 'function'
-                                                    "function": {
-                                                        "name": tool_call_chunk.function.name,
-                                                        "arguments": tool_call_chunk.function.arguments or "" # Ensure arguments is a string
-                                                    }
-                                                }
-                                            ]
+                                            "content": None,
+                                            "tool_calls": enhanced_tool_calls
                                         },
                                         "done": False
                                     }
@@ -284,21 +397,20 @@ async def chat_model(request: Request):
                     final_ollama_chunk = {
                         "model": response_model_name_for_ollama,
                         "created_at": stream_created_at,
-                        # "message": { "role": "assistant", "content": ""}, # Often empty or omitted in final Ollama stream chunk
+                        "message": { "role": "assistant", "content": ""},
                         "done": True,
                         "done_reason": "stop",
                         "total_duration": 5191566416, # Mocked
                         "load_duration": 2154458,    # Mocked
-                        "prompt_eval_count": None, # Not available in stream typically
+                        "prompt_eval_count": None,
                         "prompt_eval_duration": 383809000, # Mocked
-                        "eval_count": None, # Not available in stream typically
+                        "eval_count": None,
                         "eval_duration": 4799921000  # Mocked
                     }
                     yield f"{json.dumps(final_ollama_chunk)}\n"
                 
                 except HTTPException as e: 
                     print(f"HTTP Error during ModelScope streaming: {e.detail}")
-                    # Yield an Ollama-formatted error chunk
                     error_chunk = {
                         "model": response_model_name_for_ollama,
                         "created_at": stream_created_at,
@@ -308,7 +420,6 @@ async def chat_model(request: Request):
                     yield f"{json.dumps(error_chunk)}\n"
                 except Exception as e:
                     print(f"Error during ModelScope streaming: {e}")
-                    # Yield an Ollama-formatted error chunk
                     error_chunk = {
                         "model": response_model_name_for_ollama,
                         "created_at": stream_created_at,
