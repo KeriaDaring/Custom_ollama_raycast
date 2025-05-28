@@ -29,17 +29,14 @@ Currently, there appears to be an issue with Raycast's handling of streaming res
 
 ### Setup
 
-1.  **Clone the repository (or initialize Git if you have the files):**
-    If you are setting this up from existing local files:
+1.  **Clone the repository :**
     ```bash
-    cd /Users/keria/Documents/develop/fake_ollama
-    git init
-    git remote add origin git@github.com:KeriaDaring/custom_ollama_for_raycast.git
+    git clone https://github.com/KeriaDaring/Custom_ollama_raycast.git
     ```
 
 2.  **Navigate to the project directory (if not already there):**
     ```bash
-    cd /Users/keria/Documents/develop/fake_ollama
+    cd Custom_ollama_raycast
     ```
 
 3.  **Install dependencies:**
@@ -50,11 +47,7 @@ Currently, there appears to be an issue with Raycast's handling of streaming res
 
 4.  **Configure API Key (Important for `/api/chat` in `ollama.py`):**
     The `/api/chat` endpoint in `ollama.py` proxies requests to an external service. It currently uses a hardcoded API key.
-    Open `ollama.py` and find this line:
-    ```python
-    api_key = "sk-_vSgtWPEnKfd96G8lVJOeA" 
-    ```
-    Replace `"sk-_vSgtWPEnKfd96G8lVJOeA"` with your actual API key for the upstream service (e.g., `https://inference.nebulablock.com`). For better security, consider modifying the code to read the API key from an environment variable.
+    Please replace the configuration in *_client.py, or you can write a client for your own.
 
 ### Running the Server
 
@@ -71,35 +64,6 @@ Currently, there appears to be an issue with Raycast's handling of streaming res
     *   Set the **Ollama API Host** to `http://localhost:8000` (or `http://127.0.0.1:8000`).
     *   For the **Model Name**, you can use "deepseek" (as this is what `/api/tags` in `ollama.py` currently returns by default).
     *   In the model's **Advanced** settings within Raycast, ensure **Streaming** is enabled if you want to test streaming responses. (Be mindful of the potential Raycast-specific issues mentioned above).
-
-## Customization
-
-### Modifying `/api/chat` Behavior in `ollama.py`
-
-The core logic for handling chat requests is in the `chat_model` function within `ollama.py`. You can modify this function to:
-
-*   **Change the upstream LLM service:**
-    Update the `url` variable and the `payload` structure to match the API of a different LLM provider.
-    ```python
-    # In ollama.py, inside the chat_model function:
-    url = "https://your-new-llm-provider.com/api/chat" 
-    # ...
-    payload = {
-        "messages": messages,
-        "model": "their-model-name", 
-        # ... other parameters for the new provider
-        "stream": stream
-    }
-    ```
-
-*   **Adjust API key handling:**
-    Implement a more secure way to handle API keys, such as using environment variables (e.g., `api_key = os.getenv("MY_UPSTREAM_API_KEY")`). Remember to import `os`.
-
-*   **Transform request/response data:**
-    Modify how incoming messages are processed or how outgoing responses (both streaming and non-streaming) are formatted to ensure compatibility or add custom logic.
-
-*   **Support different models:**
-    Extend the logic to handle different model names passed in the request, potentially routing them to different upstream models or services.
 
 ### Other Endpoints
 
